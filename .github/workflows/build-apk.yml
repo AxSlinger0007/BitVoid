@@ -1,0 +1,132 @@
+
+name: Build BitVoid Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.zip"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get repository files
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Extract Construct game
+        run: |
+          ZIP=$(find . -maxdepth 1 -iname "*.zip" -print -quit)
+          if [ -z "$ZIP" ]; then
+            echo "No ZIP file found in repository root"
+            exit 1
+          fi
+
+          mkdir extracted www
+          unzip -q "$ZIP" -d extracted
+
+          INDEX=$(find extracted -type f -name index.html -print -quit)
+          if [ -z "$INDEX" ]; then
+            echo "Could not find index.html"
+            exit 1
+          fi
+
+          cp -R "$(dirname "$INDEX")/." www/
+
+      - name: Create Capacitor project
+        run: |
+          npm init -y
+          npm install @capacitor/core@6.2.1 @capacitor/android@6.2.1
+          npm install --save-dev @capacitor/cli@6.2.1
+
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.bitvoid.game",
+            "appName": "BitVoid",
+            "webDir": "www",
+            "server": {
+              "androidScheme": "https",
+              "cleartext": false
+            }
+          }
+          EOF
+
+          npx cap add android
+          npx cap sync android
+
+      - name: Configure Android TV and HTTPS
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          path = "android/app/src/main/AndroidManifest.xml"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          A = "{http://schemas.android.com/apk/res/android}"
+
+          tree = ET.parse(path)
+          root = tree.getroot()
+
+          ET.SubElement(root, "uses-feature", {
+              A + "name": "android.software.leanback",
+              A + "required": "false"
+          })
+          ET.SubElement(root, "uses-feature", {
+              A + "name": "android.hardware.touchscreen",
+              A + "required": "false"
+          })
+
+          app = root.find("application")
+          app.set(A + "usesCleartextTraffic", "false")
+
+          for activity in app.findall("activity"):
+              for intent in activity.findall("intent-filter"):
+                  actions = [
+                      e.get(A + "name")
+                      for e in intent.findall("action")
+                  ]
+                  categories = [
+                      e.get(A + "name")
+                      for e in intent.findall("category")
+                  ]
+                  if ("android.intent.action.MAIN" in actions
+                      and "android.intent.category.LAUNCHER" in categories):
+                      tv_intent = ET.SubElement(activity, "intent-filter")
+                      ET.SubElement(tv_intent, "action", {
+                          A + "name": "android.intent.action.MAIN"
+                      })
+                      ET.SubElement(tv_intent, "category", {
+                          A + "name": "android.intent.category.LEANBACK_LAUNCHER"
+                      })
+                      break
+
+          tree.write(path, encoding="utf-8", xml_declaration=True)
+          PY
+
+      - name: Build APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BitVoid-Android-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
